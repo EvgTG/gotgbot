@@ -19,6 +19,14 @@ const (
 	DefaultTimeout = time.Second * 5
 )
 
+// Context key type for request ID
+type contextKey string
+
+const (
+	// RequestIDKey is the context key for request ID
+	RequestIDKey contextKey = "request_id"
+)
+
 type BotClient interface {
 	// RequestWithContext submits a POST HTTP request a bot API instance.
 	RequestWithContext(ctx context.Context, token string, method string, params map[string]string, data map[string]FileReader, opts *RequestOpts) (json.RawMessage, error)
@@ -78,12 +86,29 @@ type RequestOpts struct {
 	Timeout time.Duration
 	// Custom API URL to use for requests.
 	APIURL string
+	// RequestID is a unique identifier for the request used for tracing and logging purposes.
+	// It will be passed through the HTTP client context to track the request flow.
+	RequestID string
+}
+
+// addRequestIDToContext adds RequestID to context if it's provided in opts
+func addRequestIDToContext(ctx context.Context, opts *RequestOpts) context.Context {
+	if opts != nil && opts.RequestID != "" {
+		return context.WithValue(ctx, RequestIDKey, opts.RequestID)
+	}
+	return ctx
 }
 
 // getTimeoutContext returns the appropriate context for the current settings.
 func (bot *BaseBotClient) getTimeoutContext(parentCtx context.Context, opts *RequestOpts) (context.Context, context.CancelFunc) {
 	if parentCtx == nil {
 		parentCtx = context.Background()
+	}
+
+	// Add RequestID to context first
+	parentCtx = addRequestIDToContext(parentCtx, opts)
+	if opts == nil && bot.DefaultRequestOpts != nil {
+		parentCtx = addRequestIDToContext(parentCtx, bot.DefaultRequestOpts)
 	}
 
 	if opts != nil {
