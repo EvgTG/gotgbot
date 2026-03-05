@@ -3,13 +3,14 @@ package main
 import (
 	"fmt"
 	"log"
+	"slices"
 	"strconv"
 	"strings"
 	"text/template"
 )
 
 var (
-	inputParamsTmpl           = template.Must(template.New("inputParamsMethod").Parse(inputParamsMethod))
+	attachTmpl                = template.Must(template.New("attachMethod").Parse(attachMethod))
 	customMarshalTmpl         = template.Must(template.New("customMarshal").Parse(customMarshal))
 	customUnmarshalTmpl       = template.Must(template.New("customUnmarshal").Parse(customUnmarshal))
 	customStructUnmarshalTmpl = template.Must(template.New("customStructUnmarshal").Parse(customStructUnmarshal))
@@ -26,6 +27,8 @@ package gotgbot
 import (
 	"encoding/json"
 	"fmt"
+	"mime/multipart"
+	"strconv"
 )
 `)
 
@@ -73,7 +76,7 @@ func generateTypeDef(d APIDescription, tgType TypeDescription) (string, error) {
 		typeDef.WriteString("\n}")
 	}
 
-	if tgType.sentByAPI(d) {
+	if tgType.receivedFromAPI(d) {
 		customUnmarshalDef, err := setupCustomUnmarshal(d, tgType)
 		if err != nil {
 			return "", fmt.Errorf("failed to setup custom unmarshal for %s: %w", tgType.Name, err)
@@ -87,23 +90,31 @@ func generateTypeDef(d APIDescription, tgType TypeDescription) (string, error) {
 	}
 	typeDef.WriteString(interfaces)
 
-	ok, fieldName, err := containsInputFile(d, tgType, map[string]bool{})
+	ok, fieldName, err := findInputFile(d, tgType, map[string]bool{})
 	if err != nil {
 		return "", fmt.Errorf("failed to check if type requires special handling: %w", err)
 	}
 	if ok {
 		// TODO: Investigate if thumbnails need special handling too.
-		err = inputParamsTmpl.Execute(&typeDef, inputParamsMethodData{
+		err = attachTmpl.Execute(&typeDef, attachMethodData{
 			Type:      tgType.Name,
 			Field:     snakeToTitle(fieldName),
 			Thumbnail: containsThumbnail(tgType),
 		})
 		if err != nil {
-			return "", fmt.Errorf("failed to generate %s inputparam methods: %w", tgType.Name, err)
+			return "", fmt.Errorf("failed to generate %s attachment methods: %w", tgType.Name, err)
 		}
 	}
 
+	if needsArrayAttachment(d, tgType) {
+		typeDef.WriteString(generateAttachableListType(tgType))
+	}
+
 	return typeDef.String(), nil
+}
+
+func needsArrayAttachment(d APIDescription, tgType TypeDescription) bool {
+	return tgType.sentAsArray(d) && containsInputFile(d, tgType)
 }
 
 func enforceTypeAssertion(name string, subtypes []TypeDescription) string {
@@ -117,25 +128,21 @@ func enforceTypeAssertion(name string, subtypes []TypeDescription) string {
 	return bd.String()
 }
 
-// fieldContainsInputFile checks whether the field's type contains any inputfiles, and thus might be used to send data.
-func fieldContainsInputFile(d APIDescription, field Field) (bool, error) {
-	goType, err := field.getPreferredType(d)
-	if err != nil {
-		return false, err
-	}
-	cleanName := strings.TrimPrefix(goType, "[]")
-	tgType, ok := d.Types[cleanName]
-	if !ok {
-		return false, nil
+func containsInputFile(d APIDescription, tgType TypeDescription) bool {
+	for _, subtype := range tgType.Subtypes {
+		ok, _, _ := findInputFile(d, d.Types[subtype], map[string]bool{})
+		if ok {
+			return true
+		}
 	}
 
-	ok, _, err = containsInputFile(d, tgType, map[string]bool{})
-	return ok, err
+	ok, _, _ := findInputFile(d, tgType, map[string]bool{})
+	return ok
 }
 
-// containsInputFile returns a boolean to indicate whether or not tgType contains an InputFile.
+// findInputFile returns a boolean to indicate whether or not tgType contains an InputFile.
 // If true, it also returns the field name of that inputfile.
-func containsInputFile(d APIDescription, tgType TypeDescription, checked map[string]bool) (bool, string, error) {
+func findInputFile(d APIDescription, tgType TypeDescription, checked map[string]bool) (bool, string, error) {
 	// If already checked, we don't need to check again. This avoids infinite recursive loops.
 	if checked[tgType.Name] {
 		return false, "", nil
@@ -157,7 +164,7 @@ func containsInputFile(d APIDescription, tgType TypeDescription, checked map[str
 		}
 
 		if isTgType(d, goType) {
-			ok, _, err := containsInputFile(d, d.Types[goType], checked)
+			ok, _, err := findInputFile(d, d.Types[goType], checked)
 			if err != nil {
 				return false, "", fmt.Errorf("failed to check if %s contains inputfiles: %w", goType, err)
 			}
@@ -194,9 +201,13 @@ func generateParentType(d APIDescription, tgType TypeDescription) (string, error
 	typeDef.WriteString(tgType.docs())
 	typeDef.WriteString(interfaceDefinition)
 
-	// If an interface type is sent by the API (eg in an update, or as a return) then we need to define custom
+	if needsArrayAttachment(d, tgType) {
+		typeDef.WriteString(generateAttachableListType(tgType))
+	}
+
+	// If an interface type is received from the API (eg in an update, or as a return) then we need to define custom
 	// UnmarshalJSON methods to handle those edge cases into the right structs.
-	if len(tgType.Subtypes) > 0 && tgType.sentByAPI(d) {
+	if len(tgType.Subtypes) > 0 && tgType.receivedFromAPI(d) {
 		unmarshalFunc, err := interfaceUnmarshalFunc(d, tgType)
 		if err != nil {
 			return "", fmt.Errorf("unable to generate interface unmarshal function: %w", err)
@@ -207,6 +218,23 @@ func generateParentType(d APIDescription, tgType TypeDescription) (string, error
 	}
 
 	return typeDef.String(), nil
+}
+
+func generateAttachableListType(tgType TypeDescription) string {
+	return fmt.Sprintf(`
+type %s []%s
+
+func (ts %s) Attach(k string, w *multipart.Writer) error {
+	for idx, item := range ts {
+		err := item.Attach(k+"_"+strconv.Itoa(idx), w)
+		if err != nil {
+			return fmt.Errorf("failed to attach to multipart field: %%w", err)
+		}
+	}
+
+	return nil
+}
+`, tgType.pluralisedName(), tgType.Name, tgType.pluralisedName())
 }
 
 // Incoming types which marshal into interfaces need special handling to make sure the interfaces are
@@ -437,14 +465,7 @@ func generateStructFields(d APIDescription, fields []Field, constantFields []str
 			return "", fmt.Errorf("failed to get preferred type: %w", err)
 		}
 
-		skip := false
-		for _, constantField := range constantFields {
-			if f.Name == constantField {
-				skip = true
-				break
-			}
-		}
-		if skip {
+		if slices.Contains(constantFields, f.Name) {
 			continue
 		}
 
@@ -480,13 +501,13 @@ func generateGenericInterfaceType(d APIDescription, name string, subtypes []Type
 		return "", fmt.Errorf("failed to get constant fields: %w", err)
 	}
 
-	hasInputFile, fieldName, err := containsInputFile(d, subtypes[0], map[string]bool{})
+	hasInputFile, fieldName, err := findInputFile(d, subtypes[0], map[string]bool{})
 	if err != nil {
 		return "", fmt.Errorf("failed to check if %s types all contain inputfiles: %w", name, err)
 	}
 
 	// If the inputfile is a common field, then the interface contains fields.
-	hasInputFile = hasInputFile && contains(fieldName, getFieldNames(commonFields))
+	hasInputFile = hasInputFile && slices.Contains(getFieldNames(commonFields), fieldName)
 
 	bd := strings.Builder{}
 	bd.WriteString(fmt.Sprintf("\ntype %s interface{", name))
@@ -498,8 +519,8 @@ func generateGenericInterfaceType(d APIDescription, name string, subtypes []Type
 		bd.WriteString(fmt.Sprintf("\nGet%s() %s", snakeToTitle(f.Name), prefType))
 	}
 	if hasInputFile {
-		bd.WriteString("\n// InputParams allows for uploading attachments with files.")
-		bd.WriteString("\nInputParams(string, map[string]FileReader) ([]byte, error)")
+		bd.WriteString("\n// Attach allows for uploading attachments with files.")
+		bd.WriteString("\nAttach")
 	}
 
 	// Only require merge funcs when there are common fields, one is a constant, and all types match across types.
@@ -765,29 +786,29 @@ func (v {{.Type}}) MarshalJSON() ([]byte, error) {
 }
 `
 
-type inputParamsMethodData struct {
+type attachMethodData struct {
 	Type      string
 	Field     string
 	Thumbnail bool
 }
 
-const inputParamsMethod = `
-func (v {{.Type}}) InputParams(mediaName string, data map[string]FileReader) ([]byte, error) {
+const attachMethod = `
+func (v {{.Type}}) Attach(mediaName string, w *multipart.Writer) error {
 	if v.{{.Field}} != nil {
-		err := v.{{.Field}}.Attach(mediaName, data)
+		err := v.{{.Field}}.Attach(mediaName, w)
 		if err != nil {
-			return nil, fmt.Errorf("failed to attach input file for %s: %w", mediaName, err)
+			return fmt.Errorf("failed to attach input file for %s: %w", mediaName, err)
 		}
 	}
 	{{ if .Thumbnail }}
 	if v.Thumbnail != nil {
-		err := v.Thumbnail.Attach(mediaName+"-thumbnail", data)
+		err := v.Thumbnail.Attach(mediaName+"-thumbnail", w)
 		if err != nil {
-			return nil, fmt.Errorf("failed to attach 'thumbnail' input file for %s: %w", mediaName, err)
+			return fmt.Errorf("failed to attach 'thumbnail' input file for %s: %w", mediaName, err)
 		}
 	}
 	{{- end }}
 
-	return json.Marshal(v)
+	return nil
 }
 `

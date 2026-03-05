@@ -5,6 +5,7 @@ import (
 	"go/format"
 	"os"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"unicode"
@@ -28,6 +29,10 @@ func (td TypeDescription) receiverName() string {
 	return receiver(td.Name)
 }
 
+func (td TypeDescription) pluralisedName() string {
+	return td.Name + "s"
+}
+
 func receiver(n string) string {
 	var rs []rune
 	for _, r := range n {
@@ -39,7 +44,26 @@ func receiver(n string) string {
 	return strings.ToLower(string(rs))
 }
 
-func (td TypeDescription) sentByAPI(d APIDescription) bool {
+func (td TypeDescription) sentAsArray(d APIDescription) bool {
+	for _, v := range d.Methods {
+		for _, f := range v.Fields {
+			t, err := f.getPreferredType(d)
+			if err != nil {
+				return false
+			}
+			s, ok := strings.CutPrefix(t, "[]")
+			if !ok {
+				continue
+			}
+			if s == toGoType(td.Name) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (td TypeDescription) receivedFromAPI(d APIDescription) bool {
 	checked := map[string]bool{}
 
 	for _, m := range d.Methods {
@@ -92,7 +116,7 @@ func (td TypeDescription) isChildType(d APIDescription, t string, typeName strin
 		return true
 	}
 
-	if contains(t, skip) {
+	if slices.Contains(skip, t) {
 		return false
 	}
 
@@ -154,6 +178,15 @@ func (m MethodDescription) docs() string {
 	return docs(strings.Title(m.Name), m.Href, m.Description)
 }
 
+func (m MethodDescription) hasField(f string) bool {
+	for _, ff := range m.Fields {
+		if ff.Name == f {
+			return true
+		}
+	}
+	return false
+}
+
 func (td TypeDescription) docs() string {
 	return docs(td.Name, td.Href, td.Description)
 }
@@ -188,6 +221,26 @@ type Field struct {
 	Types       []string `json:"types"`
 	Required    bool     `json:"required"`
 	Description string   `json:"description"`
+}
+
+var defaultsMatcher = regexp.MustCompile(`(?i)defaults to (true|false|\d+.\d+|\d+)`)
+
+func (f Field) hasDefault() (string, bool) {
+	if !strings.Contains(strings.ToLower(f.Description), "defaults to") {
+		return "", false
+	}
+
+	if strings.Contains(strings.ToLower(f.Description), "backward compatibility") ||
+		strings.Contains(strings.ToLower(f.Description), "backwards compatibility") {
+		// Backwards compatibility for "defaults" is a bad myth
+		return "", false
+	}
+
+	ms := defaultsMatcher.FindStringSubmatch(f.Description)
+	if len(ms) == 0 {
+		return "", true
+	}
+	return strings.ToLower(ms[1]), true
 }
 
 var usernameDocsMatcher = regexp.MustCompile(` +(or username.*)?\(.+ @[a-z]+\)`)
@@ -400,6 +453,14 @@ func (f Field) getPreferredType(d APIDescription) (string, error) {
 			if f.Name == "text" && strings.Contains(f.Description, "nothing will be shown") {
 				return goType, nil
 			}
+			return "*" + goType, nil
+
+		} else if v, ok := f.hasDefault(); ok && v != "" && v != getDefaultTypeVal(d, goType) {
+			if goType == "int64" && strings.Contains(f.Description, "1-") {
+				// If we have a range of 1-X, it means that the default go-type of 0 is will be ignored the server
+				return goType, nil
+			}
+
 			return "*" + goType, nil
 		}
 
